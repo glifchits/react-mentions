@@ -11,28 +11,24 @@ module.exports = React.createClass({
   displayName: 'Mention',
 
   propTypes: {
-
-    
-
     /**
      * Called when a new mention is added in the input
      *
      * Example:
      *
      * ```js
-     *  function (event, ui) {}
-     * ```
-     *
-     * `event` is the Event that was triggered.
-     * `ui` is an object:
-     *
-     * ```js
-     *  {
-     *      position: {top: 0, left: 0}
-     *  }
+     * function(suggestion) {
+     *   console.log("user " + suggestion.display + " was mentioned!");
+     * }
      * ```
      */
     onAdd: React.PropTypes.func,
+
+    /**
+     * Called when a new mention is about to be added and offers
+     * ability for suggestion modification before it's added.
+     */
+    onBeforeAdd: React.PropTypes.func,
 
     renderSuggestion: React.PropTypes.func,
 
@@ -42,6 +38,7 @@ module.exports = React.createClass({
     return {
       trigger: "@",
       onAdd: emptyFunction,
+      onBeforeAdd: emptyFunction,
       onRemove: emptyFunction,
       renderSuggestion: null
     };
@@ -106,7 +103,7 @@ var _getDataProvider = function(data) {
   }
 };
 
-var KEY = { TAB : 9, RETURN : 13, ESC : 27, UP : 38, DOWN : 40 };
+var KEY = { TAB : 9, RETURN : 13, ESC : 27, UP : 38, DOWN : 40, SPACE : 32 };
 
 
 module.exports = React.createClass({
@@ -135,11 +132,12 @@ module.exports = React.createClass({
     return {
       markup: "@[__display__](__id__)",
       singleLine: false,
-      displayTransform: null,
-
+      displayTransform: function(id, display, type) {
+        return display;
+      },
       onKeyDown: emptyFunction,
       onSelect: emptyFunction,
-      onBlur: emptyFunction
+      onBlur: emptyFunction,
     };
   },
 
@@ -381,7 +379,13 @@ module.exports = React.createClass({
       }
     }
 
+    
     var suggestionsComp = this.refs.suggestions;
+    //only one option (plus the add new user) and user presses space
+    if( suggestionsCount === 2 && suggestionsComp) {
+      keyHandlers[KEY.SPACE] = suggestionsComp.selectFocused;
+    }
+        
     if(suggestionsCount > 0 && suggestionsComp) {
       keyHandlers[KEY.ESC] = this.clearSuggestions;
       keyHandlers[KEY.DOWN] = suggestionsComp.shiftFocus.bind(null, +1);
@@ -419,6 +423,10 @@ module.exports = React.createClass({
 
   handleSuggestionsMouseDown: function(ev) {
     this._suggestionsMouseDown = true;
+  },
+
+  focusTextarea: function() {
+    this.refs.input.getDOMNode().focus();
   },
 
   autogrowTextarea: function() {
@@ -543,17 +551,16 @@ module.exports = React.createClass({
     });
   },
 
-  addMention: function(suggestion, mentionDescriptor, querySequenceStart, querySequenceEnd) {
+  processAddMention: function(suggestion, mentionDescriptor, querySequenceStart, querySequenceEnd) {
     // Insert mention in the marked up value at the correct position
     var value = LinkedValueUtils.getValue(this) || "";
-    var start = utils.mapPlainTextIndex(value, this.props.markup, querySequenceStart, false, this.props.displayTransform);
+    var start = utils.mapPlainTextIndex(value, this.props.markup, querySequenceStart, 'Start', this.props.displayTransform);
     var end = start + querySequenceEnd - querySequenceStart;
     var insert = utils.makeMentionsMarkup(this.props.markup, suggestion.id, suggestion.display, mentionDescriptor.props.type);
     var newValue = utils.spliceString(value, start, end, insert);
 
     // Refocus input and set caret position to end of mention
     this.refs.input.getDOMNode().focus();
-    
     var displayValue = this.props.displayTransform(suggestion.id, suggestion.display, mentionDescriptor.props.type);
     var newCaretPosition = querySequenceStart + displayValue.length;
     this.setState({
@@ -566,8 +573,30 @@ module.exports = React.createClass({
     var eventMock = { target: { value: newValue }};
     handleChange.call(this, eventMock, newValue);
 
+    var onAdd = mentionDescriptor.props.onAdd;
+    if(onAdd) {
+      onAdd(suggestion);
+    }
+
     // Make sure the suggestions overlay is closed
     this.clearSuggestions();
+  },
+
+  addMention: function(suggestion, mentionDescriptor, querySequenceStart, querySequenceEnd) {
+    var onBeforeAdd = mentionDescriptor.props.onBeforeAdd;
+    //pass the selected mention up to the onBeforeAdd function if provided
+    if(onBeforeAdd) {
+      //get the type offset
+      var caretEl = this.refs.caret.getDOMNode();
+      var highligherEl = this.refs.highlighter.getDOMNode();
+      var leftOffset = caretEl.offsetLeft - highligherEl.scrollLeft + "px";
+      var topOffset = caretEl.offsetTop - highligherEl.scrollTop + "px";
+      onBeforeAdd(suggestion, mentionDescriptor, querySequenceStart, querySequenceEnd, leftOffset, topOffset, this.processAddMention);
+    }
+    else {
+      this.processAddMention(suggestion, mentionDescriptor, querySequenceStart, querySequenceEnd);
+    }
+    
   },
 
   _queryId: 0
@@ -663,14 +692,14 @@ module.exports = React.createClass({
 
     return (
       React.createElement("li", {key: id, ref: isFocused && "focused", className: cls, onClick: handleClick, onMouseEnter: this.handleMouseEnter.bind(null, index)}, 
-        content 
+         content 
       )
     );
   },
 
   renderHighlightedDisplay: function(display, query) {
     var i = display.toLowerCase().indexOf(query.toLowerCase());
-    if(i === -1) return React.createElement("span", null, display );
+    if(i === -1) return React.createElement("span", null,  display );
 
     return (
       React.createElement("span", null, 
@@ -884,9 +913,13 @@ module.exports = {
 
   // For the passed character index in the plain text string, returns the corresponding index
   // in the marked up value string.
-  // If the passed character index lies inside a mention, returns the index of the mention 
-  // markup's first char, or respectively tho one after its last char, if the flag `toEndOfMarkup` is set.
-  mapPlainTextIndex: function(value, markup, indexInPlainText, toEndOfMarkup, displayTransform) {
+  // If the passed character index lies inside a mention, the value of `inMarkupCorrection` defines the
+  // correction to apply:
+  //   - 'START' to return the index of the mention markup's first char
+  //   - 'END' to return the index after its last char
+  //   - false to not apply any correction
+  mapPlainTextIndex: function(value, markup, indexInPlainText, inMarkupCorrection, displayTransform) {
+    typeof inMarkupCorrection !== 'undefined' ? inMarkupCorrection : 'START';
     if(!this.isNumber(indexInPlainText)) {
       return indexInPlainText;
     }
@@ -895,7 +928,7 @@ module.exports = {
     var textIteratee = function(substr, index, substrPlainTextIndex) {
       if(result !== undefined) return;
 
-      if(substrPlainTextIndex + substr.length >= indexInPlainText) {
+      if( substrPlainTextIndex + substr.length >= indexInPlainText) {
         // found the corresponding position in the current plain text range
         result = index + indexInPlainText - substrPlainTextIndex;
       }
@@ -903,11 +936,11 @@ module.exports = {
     var markupIteratee = function(markup, index, mentionPlainTextIndex, id, display, type, lastMentionEndIndex) {
       if(result !== undefined) return;
 
-      if(mentionPlainTextIndex + display.length > indexInPlainText) {
+      if(inMarkupCorrection + mentionPlainTextIndex + display.length > indexInPlainText) {
         // found the corresponding position inside current match,
         // return the index of the first or after the last char of the matching markup
         // depending on whether the `toEndOfMarkup` is set
-        result = index + (toEndOfMarkup ? markup.length : 0);
+        result = index + (inMarkupCorrection=='END' ? markup.length : 0);
       }
     };
 
@@ -954,13 +987,39 @@ module.exports = {
       spliceEnd = Math.max(selectionEndBeforeChange, selectionStartBeforeChange + lengthDelta);
     }
     
-    // splice the current marked up value and insert new chars
-    return this.spliceString(
-      value,
-      this.mapPlainTextIndex(value, markup, spliceStart, false, displayTransform),
-      this.mapPlainTextIndex(value, markup, spliceEnd, true, displayTransform),
-      insert
-    );
+    var mappedSpliceStart = this.mapPlainTextIndex(value, markup, spliceStart, 'START', displayTransform);
+    var controlSpliceStart = this.mapPlainTextIndex(value, markup, spliceStart, false, displayTransform);
+    var mappedSpliceEnd = this.mapPlainTextIndex(value, markup, spliceEnd, 'END', displayTransform);
+    var controlSpliceEnd = this.mapPlainTextIndex(value, markup, spliceEnd, false, displayTransform);
+    var willRemoveMention = mappedSpliceStart !== controlSpliceStart || mappedSpliceEnd !== controlSpliceEnd;
+
+    var newValue = this.spliceString(value, mappedSpliceStart, mappedSpliceEnd, insert);
+
+    if(!willRemoveMention) {
+      // test for auto-completion changes
+      var controlPlainTextValue = this.getPlainText(newValue, markup, displayTransform);
+      if(controlPlainTextValue !== plainTextValue) {
+        // some auto-correction is going on
+
+        // find start of diff
+        spliceStart = 0;
+        while(plainTextValue[spliceStart] === controlPlainTextValue[spliceStart])
+          spliceStart++
+
+        // extract auto-corrected insertion
+        insert = plainTextValue.slice(spliceStart, selectionEndAfterChange)
+
+        // find index of the unchanged remainder
+        spliceEnd = oldPlainTextValue.lastIndexOf(plainTextValue.substring(selectionEndAfterChange))
+
+        // re-map the corrected indices
+        mappedSpliceStart = this.mapPlainTextIndex(value, markup, spliceStart, 'START', displayTransform);
+        mappedSpliceEnd = this.mapPlainTextIndex(value, markup, spliceEnd, 'END', displayTransform);
+        newValue = this.spliceString(value, mappedSpliceStart, mappedSpliceEnd, insert);
+      }
+    }
+    
+    return newValue;
   },
 
   getPlainText: function(value, markup, displayTransform) {
